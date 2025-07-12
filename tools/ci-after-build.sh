@@ -17,7 +17,7 @@ if [[ "${TARGET_OS}" == "iOS"* || "${TARGET_OS}" == "tvOS"* || "${TARGET_OS}" ==
   find ffmpeg-${SUFFIX} -name "*.dylib" -delete
 fi
 $TAR Jcf ffmpeg-${SUFFIX}{.tar.xz,}
-# ls -lh *.xz
+ls -lh *.xz
 # [ "$GITHUB_EVENT_NAME" == "pull_request" ] && exit 0
 
 # echo "SF_USER_MAPPED: $SF_USER_MAPPED"
