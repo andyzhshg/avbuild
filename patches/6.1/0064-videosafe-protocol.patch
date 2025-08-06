@@ -6,8 +6,8 @@ Subject: [PATCH] vs
 ---
  libavformat/Makefile             |   4 +
  libavformat/protocols.c          |   2 +
- libavformat/videosafe_protocol.c | 195 +++++++++++++++++++++++++++++++
- 3 files changed, 201 insertions(+)
+ libavformat/videosafe_protocol.c | 198 +++++++++++++++++++++++++++++++
+ 3 files changed, 204 insertions(+)
  create mode 100644 libavformat/videosafe_protocol.c
 
 diff --git a/libavformat/Makefile b/libavformat/Makefile
@@ -43,7 +43,7 @@ new file mode 100644
 index 0000000000..f552b45f76
 --- /dev/null
 +++ b/libavformat/videosafe_protocol.c
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,198 @@
 +#include <string.h>
 +#include <stdlib.h>
 +#include <ctype.h>
