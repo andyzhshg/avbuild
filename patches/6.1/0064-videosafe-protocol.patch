@@ -210,6 +210,9 @@ index 0000000000..f552b45f76
 +
 +static int64_t videosafe_seek(URLContext *h, int64_t pos, int whence) {
 +    VideoSafeContext *ctx = h->priv_data;
++    if (whence == AVSEEK_SIZE) {
++        return ffurl_size(ctx->inner);  // 向底层获取大小
++    }
 +    int64_t ret = ffurl_seek(ctx->inner, pos, whence);
 +    if (ret >= 0) {
 +        ctx->offset = ret;
