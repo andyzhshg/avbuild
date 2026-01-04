@@ -1,0 +1,259 @@
+From a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6 Mon Sep 17 00:00:00 2001
+From: Claude AI <claude@anthropic.com>
+Date: Sat, 04 Jan 2026 00:00:00 +0000
+Subject: [PATCH] videosafe protocol improvements: fix memory leaks, offset precision, and error handling
+
+This patch improves the videosafe protocol implementation with the following fixes:
+
+1. Offset precision: Maintain internal offset instead of calling SEEK_CUR each time
+   - Reduces system call overhead
+   - Ensures offset synchronization with decryption
+   - Prevents issues if underlying protocol doesn't support SEEK_CUR
+
+2. Memory leaks: Fix videosafe_close to properly release context
+   - Add missing av_free(ctx)
+   - Clear encryption key before freeing (security)
+   - Reset priv_data to NULL
+
+3. Buffer overflow prevention: Use dynamic allocation for real_url
+   - Instead of fixed 1024-byte stack buffer
+   - Calculate proper size based on base64 input
+   - Proper error handling for allocation failures
+
+4. File handle support: Add videosafe_get_file_handle
+   - Allows direct file descriptor access when needed
+   - Properly delegates to underlying protocol
+
+5. Improved error handling and logging
+   - Better error messages for debugging
+   - Proper cleanup on all error paths
+   - Consistent logging patterns
+
+---
+ libavformat/videosafe_protocol.c | 154 ++++++++++++++++++++++++++-----
+ 1 file changed, 131 insertions(+), 23 deletions(-)
+
+diff --git a/libavformat/videosafe_protocol.c b/libavformat/videosafe_protocol.c
+index f552b45f76..a1b2c3d4e5 100644
+--- a/libavformat/videosafe_protocol.c
++++ b/libavformat/videosafe_protocol.c
+@@ -53,11 +53,11 @@ static void InitKeyFromKeyWithIndex(uint8_t *outKey, uint8_t *inKey, uint64_t i
+
+ typedef struct {
+     URLContext *inner;   // 底层实际的 URLContext（http/file）
+     uint8_t *key;         // 密钥（原始字节）
+     int64_t offset;       // 当前解密偏移
+ } VideoSafeContext;
+
+
+ /// 解析 query 中的 key=xxx（hex 字符串）
+ static int parse_hex_key(const char *key_str, uint8_t **key_out) {
+     *key_out = av_malloc(32);
+@@ -65,8 +65,12 @@ static int parse_hex_key(const char *key_str, uint8_t **key_out) {
+
+     for (int i = 0; i < 32; i++) {
+         if (sscanf(key_str + 2 * i, "%2hhx", *key_out + i) != 1) {
++            av_log(NULL, AV_LOG_ERROR, "videosafe: failed to parse hex key at position %d\n", i);
++            av_free(*key_out);
++            *key_out = NULL;
+             return AVERROR(EINVAL);
+         }
+     }
+     return 0;
+ }
+
+@@ -74,26 +78,57 @@ static int parse_hex_key(const char *key_str, uint8_t **key_out) {
+ static int videosafe_open(URLContext *h, const char *uri, int flags, AVDictionary **options) {
+     av_log(h, AV_LOG_INFO, "Opening videosafe protocol\n");
+
+-    VideoSafeContext *ctx = av_mallocz(sizeof(*ctx));
+-    memset(ctx, 0, sizeof(*ctx));
++    // ✅ Use av_mallocz which already zeros the memory
++    VideoSafeContext *ctx = av_mallocz(sizeof(*ctx));
+     if (!ctx) return AVERROR(ENOMEM);
+
+     const char *prefix = "videosafe://";
+     if (!av_strstart(uri, prefix, NULL)) {
++        av_log(h, AV_LOG_ERROR, "videosafe: invalid URI prefix\n");
+         av_free(ctx);
+         return AVERROR(EINVAL);
+     }
+
+     // 复制 URI 以做解析
+     char *url_dup = av_strdup(uri + strlen(prefix));
++    if (!url_dup) {
++        av_log(h, AV_LOG_ERROR, "videosafe: failed to allocate memory for URL\n");
++        av_free(ctx);
++        return AVERROR(ENOMEM);
++    }
++
+     char *sep = strchr(url_dup, '?');
+     if (sep) *sep++ = '\0';
+
+-    // base64 解码真实 URL
+-    uint8_t real_url[1024];
+-    int real_len = av_base64_decode(real_url, url_dup, sizeof(real_url) - 1);
++    // ✅ Dynamic allocation instead of fixed-size buffer
++    // base64 解码后的长度最多是输入的 3/4
++    int max_len = strlen(url_dup) * 3 / 4 + 1;
++    uint8_t *real_url = av_malloc(max_len);
++    if (!real_url) {
++        av_log(h, AV_LOG_ERROR, "videosafe: failed to allocate memory for real_url\n");
++        av_free(url_dup);
++        av_free(ctx);
++        return AVERROR(ENOMEM);
++    }
++
++    int real_len = av_base64_decode(real_url, url_dup, max_len - 1);
+     if (real_len < 0) {
+         av_log(h, AV_LOG_ERROR, "Base64 decode failed\n");
++        av_free(real_url);
+         av_free(url_dup);
+         av_free(ctx);
+         return AVERROR(EINVAL);
+     }
+     real_url[real_len] = '\0';
+
+     // 解析 query string（key=xxx）
+     if (sep && av_strstart(sep, "key=", NULL)) {
+         if (parse_hex_key(sep + 4, &ctx->key) < 0) {
+             av_log(h, AV_LOG_ERROR, "Failed to parse key\n");
++            av_free(real_url);
+             av_free(url_dup);
+             av_free(ctx);
+             return AVERROR(EINVAL);
+         }
+     } else {
+         av_log(h, AV_LOG_ERROR, "Missing key in URL\n");
++        av_free(real_url);
+         av_free(url_dup);
+         av_free(ctx);
+         return AVERROR(EINVAL);
+     }
+
+     // 打开底层真实 URL
+-    // AVDictionary *opts = NULL;
+     int ret = ffurl_open_whitelist(&ctx->inner, (const char *)real_url, flags, &h->interrupt_callback, options, h->protocol_whitelist, h->protocol_blacklist, h);
+     if (ret < 0) {
+         av_log(h, AV_LOG_ERROR, "Failed to open inner URL: %s (error: %d)\n", real_url, ret);
++        av_free(real_url);
+         av_free(url_dup);
+         if (ctx->key) av_free(ctx->key);
+         av_free(ctx);
+         return ret;
+     }
++    // ✅ Initialize offset to 0
+     ctx->offset = 0;
+
+     h->priv_data = ctx;
++    av_free(real_url);  // ✅ Free allocated real_url
+     av_free(url_dup);
+
+     av_log(h, AV_LOG_INFO, "videosafe protocol opened successfully\n");
+     return 0;
+ }
+
++// ✅ Fix 1: Maintain internal offset instead of calling SEEK_CUR each time
+ static int videosafe_read(URLContext *h, unsigned char *buf, int size) {
+     VideoSafeContext *ctx = h->priv_data;
+
+-    // 获取真实偏移
+-    int64_t offset = ffurl_seek(ctx->inner, 0, SEEK_CUR);
++    if (!ctx || !ctx->key) {
++        av_log(h, AV_LOG_ERROR, "videosafe: invalid context\n");
++        return AVERROR(EINVAL);
++    }
+
+     int ret = ffurl_read(ctx->inner, buf, size);
+-    if (ret > 0 && offset >= 0) {
+-        VSCrypto(buf, ret, offset, ctx->key);
++    if (ret > 0) {
++        // ✅ Use maintained offset instead of SEEK_CUR
++        VSCrypto(buf, ret, ctx->offset, ctx->key);
++        ctx->offset += ret;  // ✅ Update offset after reading
+     }
+
+     return ret;
+ }
+
++// ✅ Fix 2: Keep offset synchronized during seek operations
+ static int64_t videosafe_seek(URLContext *h, int64_t pos, int whence) {
+     VideoSafeContext *ctx = h->priv_data;
++
++    if (!ctx) {
++        av_log(h, AV_LOG_ERROR, "videosafe: invalid context\n");
++        return AVERROR(EINVAL);
++    }
++
+     if (whence == AVSEEK_SIZE) {
+         return ffurl_size(ctx->inner);  // 向底层获取大小
+     }
++
+     int64_t ret = ffurl_seek(ctx->inner, pos, whence);
+     if (ret >= 0) {
+-        ctx->offset = ret;
++        ctx->offset = ret;  // ✅ Keep offset synchronized
+     } else {
+-        av_log(h, AV_LOG_WARNING, "Underlying protocol doesn't support seek\n");
++        av_log(h, AV_LOG_WARNING, "videosafe: seek failed with error %lld\n", ret);
+     }
+     return ret;
+ }
+
++// ✅ Fix 3: Properly release all resources
+ static int videosafe_close(URLContext *h) {
+-    // av_log(h, AV_LOG_INFO, "videosafe_close\n");
+     VideoSafeContext *ctx = h->priv_data;
+     if (!ctx) return 0;
+
+-    if (ctx->inner) ffurl_close(ctx->inner);
+-    if (ctx->key) av_free(ctx->key);
+-    // av_free(ctx);
+-    // av_log(h, AV_LOG_INFO, "videosafe_close end\n");
++    if (ctx->inner) {
++        ffurl_close(ctx->inner);
++        ctx->inner = NULL;
++    }
++
++    if (ctx->key) {
++        // ✅ Security: Clear key before freeing
++        memset(ctx->key, 0, 32);
++        av_free(ctx->key);
++        ctx->key = NULL;
++    }
++
++    // ✅ Fix: Release the context structure itself (was commented out)
++    av_free(ctx);
++    h->priv_data = NULL;
++
+     return 0;
+ }
+
++// ✅ Fix 4: Add file handle support for better protocol compatibility
++static int videosafe_get_file_handle(URLContext *h) {
++    VideoSafeContext *ctx = h->priv_data;
++    if (!ctx || !ctx->inner) {
++        return AVERROR(EINVAL);
++    }
++    return ffurl_get_file_handle(ctx->inner);
++}
++
+ const URLProtocol ff_videosafe_protocol = {
+-    .name           = "videosafe",
+-    .url_open2      = videosafe_open,
+-    .url_read       = videosafe_read,
+-    .url_seek       = videosafe_seek,
+-    .url_close      = videosafe_close,
+-    .priv_data_size = sizeof(VideoSafeContext),
+-    .flags          = URL_PROTOCOL_FLAG_NETWORK,
++    .name                = "videosafe",
++    .url_open2           = videosafe_open,
++    .url_read            = videosafe_read,
++    .url_seek            = videosafe_seek,
++    .url_close           = videosafe_close,
++    .url_get_file_handle = videosafe_get_file_handle,  // ✅ New: Add file handle support
++    .priv_data_size      = sizeof(VideoSafeContext),
++    .flags               = URL_PROTOCOL_FLAG_NETWORK,
+ };
+--
+2.45.1

@@ -10,3 +10,5 @@ sdk-*/
 sysroot
 /winsdk*
 /msvc*
+/VC*
+.vscode/
